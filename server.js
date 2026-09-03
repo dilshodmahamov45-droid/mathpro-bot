@@ -6,6 +6,13 @@
  * `telegramId` maydoni orqali bog'laydi. Bu maydon sayt tomonidan (index.html)
  * Telegram Mini App ichida test topshirilganda avtomatik yoziladi.
  *
+ * "Test tahlili" — istalgan turdagi material (video, PDF, rasm, matn xabar).
+ * Admin (o'qituvchi) /addtahlil buyrug'i orqali PIN+nom+material yuboradi,
+ * bot uni Firestore'ga (fromChatId+messageId sifatida) saqlab qo'yadi.
+ * O'quvchi "Test tahlili"ni bosganda, ro'yxatdan testni tanlaydi, bot esa
+ * o'sha aslidagi xabarni (qanday turda bo'lishidan qat'i nazar) unga
+ * copyMessage orqali qayta yuboradi.
+ *
  * Ishga tushirish uchun quyidagi muhit o'zgaruvchilari (environment variables)
  * kerak — Render'da "Environment" bo'limida qo'shiladi:
  *   BOT_TOKEN                 - @BotFather bergan token
@@ -15,6 +22,9 @@
  *   FIREBASE_SERVICE_ACCOUNT   - Firebase konsolidan olingan xizmat hisobi
  *                                 (service account) JSON faylining TO'LIQ matni,
  *                                 bitta qatorga joylashtirilgan holda
+ *   ADMIN_ID                   - sizning shaxsiy Telegram ID raqamingiz (/whoami
+ *                                 buyrug'i orqali bilib olasiz), faqat shu odam
+ *                                 "Test tahlili" material qo'sha oladi
  *   PORT                       - Render o'zi avtomatik beradi, qo'lda kerak emas
  */
 
@@ -25,6 +35,7 @@ const admin = require('firebase-admin');
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const SITE_URL = (process.env.SITE_URL || '').replace(/\/$/, '');
 const WEBHOOK_URL = (process.env.WEBHOOK_URL || '').replace(/\/$/, '');
+const ADMIN_ID = process.env.ADMIN_ID ? Number(process.env.ADMIN_ID) : null;
 const PORT = process.env.PORT || 3000;
 
 if (!BOT_TOKEN) { console.error('BOT_TOKEN muhit o\'zgaruvchisi topilmadi!'); process.exit(1); }
@@ -46,6 +57,8 @@ const bot = new Telegraf(BOT_TOKEN);
 // Har bir chat uchun "hozir nima kutilmoqda" holatini eslab turamiz
 // (masalan "Testni boshlash" bosilgach, keyingi xabar PIN kod deb kutiladi).
 const pendingState = new Map();
+// Admin "test tahlili" qo'shayotganda, PIN+nomni vaqtincha shu yerda saqlaymiz
+const adminDraft = new Map();
 
 const mainKeyboard = Markup.keyboard([
   ['🧪 Testni boshlash'],
@@ -67,16 +80,33 @@ bot.hears('🧪 Testni boshlash', (ctx) => {
 });
 
 bot.hears('📊 Natijalarim', async (ctx) => {
-  await sendResultsList(ctx, false);
+  await sendResultsList(ctx);
 });
 
 bot.hears('🔍 Test tahlili', async (ctx) => {
-  await sendResultsList(ctx, true);
+  await sendTahlilList(ctx);
 });
 
-// Oddiy matn xabarlari — faqat "PIN kutilmoqda" holatida ishlov beriladi
+// Faqat admin (o'qituvchi) uchun: yangi "test tahlili" materiali qo'shish
+bot.command('addtahlil', (ctx) => {
+  if (!isAdmin(ctx)) { return; }
+  pendingState.set(ctx.chat.id, 'admin_awaiting_pin');
+  ctx.reply('Qaysi test uchun? PIN kodini yuboring:', Markup.removeKeyboard());
+});
+
+// O'zining Telegram ID raqamini bilish uchun (ADMIN_ID sozlamasiga kerak bo'ladi)
+bot.command('whoami', (ctx) => {
+  ctx.reply(`Sizning Telegram ID: ${ctx.from.id}`);
+});
+
+function isAdmin(ctx) {
+  return ADMIN_ID && ctx.from.id === ADMIN_ID;
+}
+
+// Oddiy matn xabarlari — PIN yoki admin oqimidagi qadamlar uchun ishlov beriladi
 bot.on('text', async (ctx) => {
   const state = pendingState.get(ctx.chat.id);
+
   if (state === 'awaiting_pin') {
     const pin = ctx.message.text.trim();
     if (!/^\d{6}$/.test(pin)) {
@@ -92,17 +122,122 @@ bot.on('text', async (ctx) => {
     await ctx.reply('Yana biror amal tanlang:', mainKeyboard);
     return;
   }
+
+  if (state === 'admin_awaiting_pin' && isAdmin(ctx)) {
+    const pin = ctx.message.text.trim();
+    if (!/^\d{6}$/.test(pin)) {
+      ctx.reply('PIN kod 6 ta raqamdan iborat bo\'lishi kerak. Qayta urinib ko\'ring:');
+      return;
+    }
+    adminDraft.set(ctx.chat.id, { pin });
+    pendingState.set(ctx.chat.id, 'admin_awaiting_title');
+    ctx.reply('Bu material uchun qisqa nom bering (masalan: "1-mock test tahlili"):');
+    return;
+  }
+
+  if (state === 'admin_awaiting_title' && isAdmin(ctx)) {
+    const draft = adminDraft.get(ctx.chat.id) || {};
+    draft.title = ctx.message.text.trim();
+    adminDraft.set(ctx.chat.id, draft);
+    pendingState.set(ctx.chat.id, 'admin_awaiting_content');
+    ctx.reply('Endi materialning o\'zini yuboring — video, PDF, rasm yoki oddiy matn xabar bo\'lishi mumkin:');
+    return;
+  }
+
+  // "admin_awaiting_content" holatida ham matn xabar kelishi mumkin (masalan
+  // tahlil oddiy yozma matn bo'lsa) — shuni umumiy saqlash funksiyasiga uzatamiz
+  if (state === 'admin_awaiting_content' && isAdmin(ctx)) {
+    await saveTahlilContent(ctx);
+    return;
+  }
   // Boshqa holatda hech narsa qilmaymiz (tugmalar reply-keyboard orqali ishlaydi)
 });
 
-// O'quvchining o'z Telegram ID'siga bog'langan javoblarini Firestore'dan olib keladi
+// Video, PDF (document), rasm — admin "material kutilmoqda" holatida bo'lsa saqlaymiz
+bot.on(['video', 'document', 'photo'], async (ctx) => {
+  const state = pendingState.get(ctx.chat.id);
+  if (state === 'admin_awaiting_content' && isAdmin(ctx)) {
+    await saveTahlilContent(ctx);
+  }
+});
+
+// Admin yuborgan xabarni (matn, video, PDF, rasm — qanday bo'lishidan qat'i
+// nazar) Firestore'ga "qayerdan olib kelish kerakligi" (chat+xabar ID) sifatida
+// saqlaymiz. Keyinchalik shu ID orqali copyMessage bilan boshqa foydalanuvchiga
+// aynan shu xabarni (turi qanday bo'lishidan qat'i nazar) qayta yuboramiz.
+async function saveTahlilContent(ctx) {
+  const draft = adminDraft.get(ctx.chat.id);
+  if (!draft || !draft.pin) {
+    ctx.reply('Xatolik: avval /addtahlil buyrug\'i bilan qaytadan boshlang.');
+    return;
+  }
+  try {
+    await db.collection('testAnalysis').doc(draft.pin).set({
+      pin: draft.pin,
+      title: draft.title || ('Test ' + draft.pin),
+      fromChatId: ctx.chat.id,
+      messageId: ctx.message.message_id,
+      addedAt: new Date().toISOString()
+    });
+    ctx.reply(`✅ Saqlandi! Endi o'quvchilar "🔍 Test tahlili" orqali "${draft.title}" materialini ko'ra oladi.`, mainKeyboard);
+  } catch (e) {
+    console.error(e);
+    ctx.reply('Saqlashda xatolik yuz berdi: ' + e.message);
+  } finally {
+    pendingState.delete(ctx.chat.id);
+    adminDraft.delete(ctx.chat.id);
+  }
+}
+
+// Barcha mavjud "test tahlili" materiallarini ro'yxat qilib ko'rsatamiz
+async function sendTahlilList(ctx) {
+  let items;
+  try {
+    const snap = await db.collection('testAnalysis').get();
+    items = snap.docs.map(d => d.data());
+    items.sort((a, b) => String(b.addedAt || '').localeCompare(String(a.addedAt || '')));
+  } catch (e) {
+    console.error(e);
+    ctx.reply('Ro\'yxatni olishda xatolik yuz berdi. Birozdan so\'ng qayta urinib ko\'ring.');
+    return;
+  }
+  if (!items.length) {
+    ctx.reply('Hozircha hech qanday test tahlili qo\'shilmagan.');
+    return;
+  }
+  const buttons = items.map(r => [Markup.button.callback('📄 ' + r.title, 'tahlil:' + r.pin)]);
+  ctx.reply('🔍 Qaysi test tahlilini ko\'rmoqchisiz?', Markup.inlineKeyboard(buttons));
+}
+
+// Foydalanuvchi ro'yxatdan birini tanlaganda — o'sha aslidagi xabarni unga qayta yuboramiz
+bot.action(/^tahlil:(\d{6})$/, async (ctx) => {
+  const pin = ctx.match[1];
+  await ctx.answerCbQuery();
+  try {
+    const doc = await db.collection('testAnalysis').doc(pin).get();
+    if (!doc.exists) {
+      ctx.reply('Bu material endi mavjud emas.');
+      return;
+    }
+    const { fromChatId, messageId } = doc.data();
+    await ctx.telegram.copyMessage(ctx.chat.id, fromChatId, messageId);
+  } catch (e) {
+    console.error(e);
+    ctx.reply('Materialni yuborishda xatolik yuz berdi.');
+  }
+});
+
+// O'quvchining o'z Telegram ID'siga bog'langan javoblarini Firestore'dan olib keladi.
+// Diqqat: faqat where() ishlatamiz (orderBy() bilan birga ishlatilsa, Firestore
+// maxsus "composite index" talab qilib, hali yaratilmagani uchun xato beradi) —
+// tartiblashni o'zimiz JavaScript'da qilamiz, bu hech qanday indeks talab qilmaydi.
 async function fetchMyResponses(telegramId, limit = 10) {
   const snap = await db.collection('responses')
     .where('telegramId', '==', telegramId)
-    .orderBy('submittedAt', 'desc')
-    .limit(limit)
     .get();
-  return snap.docs.map(d => ({ id: d.id, ...d.data() }));
+  const items = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+  items.sort((a, b) => String(b.submittedAt || '').localeCompare(String(a.submittedAt || '')));
+  return items.slice(0, limit);
 }
 
 function formatDate(iso) {
@@ -112,7 +247,7 @@ function formatDate(iso) {
   } catch (e) { return ''; }
 }
 
-async function sendResultsList(ctx, detailed) {
+async function sendResultsList(ctx) {
   const telegramId = ctx.from.id;
   let items;
   try {
@@ -126,25 +261,12 @@ async function sendResultsList(ctx, detailed) {
     ctx.reply('Hozircha hech qanday test topshirmagansiz. Avval "🧪 Testni boshlash" orqali test yeching.');
     return;
   }
-  if (!detailed) {
-    // "Natijalarim" — qisqa ro'yxat, oddiy matn
-    const lines = items.map((r, i) => {
-      const score = round1(r.score);
-      const total = round1(r.total);
-      return `${i + 1}. ${r.testTitle || 'Test'} — ${score}/${total} ball  (${formatDate(r.submittedAt)})`;
-    });
-    ctx.reply('📊 So\'nggi natijalaringiz:\n\n' + lines.join('\n'));
-    return;
-  }
-  // "Test tahlili" — har biri uchun batafsil ko'rish tugmasi (Mini App ichida ochiladi)
-  const buttons = items.map(r => {
+  const lines = items.map((r, i) => {
     const score = round1(r.score);
     const total = round1(r.total);
-    const label = `${r.testTitle || 'Test'} — ${score}/${total}`;
-    const url = `${SITE_URL}/?review=${r.id}`;
-    return [Markup.button.webApp(label, url)];
+    return `${i + 1}. ${r.testTitle || 'Test'} — ${score}/${total} ball  (${formatDate(r.submittedAt)})`;
   });
-  ctx.reply('🔍 Batafsil ko\'rish uchun testni tanlang:', Markup.inlineKeyboard(buttons));
+  ctx.reply('📊 So\'nggi natijalaringiz:\n\n' + lines.join('\n'));
 }
 
 function round1(n) {
